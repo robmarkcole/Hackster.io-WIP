@@ -1,0 +1,157 @@
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+XXXXXXXXXXXXXXXXXXXXXXXXXXX Sample Automation XXXXXXXXXXXXXXXXXXXXXXXXXXX
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+1.	Install Facebox: https://machinebox.io/docs/setup https://machinebox.io/login?return_url=%2Faccount
+-	Docker compose:
+facebox:
+  container_name: facebox
+  image: machinebox/facebox:latest
+  restart: unless-stopped
+  environment:
+  - MB_KEY=youkey
+  ports:
+  - "8080:8080"
+-	Command line:
+sudo docker run -tid --name=facebox --restart=unless-stopped -p 8080:8080 -e MB_KEY=yourkey machinebox/facebox
+
+2.	Teach faces: Utilise Robin’s python script to upload faces. Copy/install teach.py <requires sudo apt install python-pip and pip install requests. Follow guide at https://github.com/robmarkcole/facebox_python >
+
+3.	Integrate into Home Assistant: https://github.com/robmarkcole/HASS-Machinebox-Facebox. Add to your configuration.yaml file.
+
+image_processing:
+- platform: facebox
+  ip_address: localhost # or e.g. 192.168.0.1
+  port: 8080
+  source:
+  - entity_id: camera.local_file <https://www.home-assistant.io/components/camera.local_file/ >
+
+camera:
+- platform: local_file
+  name: Saved Image
+    file_path: /config/www/facebox/tmp/image.jpg < created a facebox dir in Local with a tmp subdir>
+
+I suggest following the “Optimising resources” recommendation mentioned in Robin’s Github. Essentially the default scanning cycle can take an unnecessary toll on RAM. In my implementation scan is activated when necessary.
+
+4.	Automate: The following is a sample automation, which captures a face using a motion trigger and announces the individual via TTS.
+
+sensor: This sensor captures the “name” of the identified individual from the json.
+- platform: template
+  sensors:
+    facebox_detection:
+      friendly_name: 'Facebox Detection'
+      value_template: '{{ states.image_processing.facebox_saved_images.attributes.faces[0]["name"].title<> }}'
+
+automation: The automation is triggered by motion
+- id: facebox_announcement
+  alias: 'Facebox Announcement'
+  initial_state: on
+  trigger:
+  - platform: state
+    entity_id: binary_sensor.entrance_motion
+    to: 'on'
+  action:
+  - delay: 00:00:02
+  - service: camera.snapshot
+    data:
+      entity_id: camera.hass_tablet  <your doorbell camera>
+      filename: '/config/www/facebox/tmp/image.jpg' < created a facebox dir in Local with a tmp subdir>
+  - delay: 00:00:01
+  - service: image_processing.scan <here I call the scan service, in line with the resource optimisation note>
+      entity_id: image_processing.facebox_saved_images
+  - delay: 00:00:02
+  - service_template: '{% if states.sensor.facebox_detection.state != "unknown" %} tts.google_say {% endif %}'
+    data_template:
+      entity_id: media_player.bluenano <chromecast>
+      message: '{% if states.sensor.facebox_detection.state != "unknown" %}  {{ states<"sensor.facebox_detection"> }} is at the door {% else %} {% endif %}'
+  - service: media_player.volume_set
+    data:
+      entity_id: media_player.bluenano
+      volume_level: 0.9
+
+
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+XXXXXXXXXXXXXXXXXXXXXX Automating Face Reload XXXXXXXXXXXXXXXXXXXXXXXXXXX
+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+The Facebox free tier has, off course, a few limitations. Namely inability to retain previously loaded faces in the event of docker container restart (Faceprint feature). In order to overcome this limitation, I implemented an automation which reloads the faces utilising the teach.py script mentioned in step 2 above.
+
+1.	Execute shell commands via ssh from the Home Assistant docker container:
+
+a.	Modify the host user privileges to skip typing your password with sudo
+          sudo visudo
+          hostuser ALL=(ALL) NOPASSWD:ALL
+
+b.	Mount this volume in HA container to preserve the sshkey generated from the HA container and used to execute shell commands. Key will then persist through reboot or upgrades.
+          -v /home/hass/docker/sshkey/.ssh:/root/.ssh
+          "/home/hass/docker/sshkey/.ssh" needs to be your own path
+
+i.e
+run docker:
+sudo docker run -tid --name="homeassistant" --restart=always -v /home/hass/docker/homeassistant:/config -v /etc/localtime:/etc/localtime:ro -v /etc/letsencrypt:/certs -v /home/hass/docker/sshkey/.ssh:/root/.ssh --net=host --privileged --device /dev/ttyACM0:/dev/ttyACM0 --device /dev/tty1:/dev/tty1 homeassistant/home-assistant
+
+c.	Login to HA container via portainer or sudo docker exec -it <container_id> /bin/bash/
+
+d.	Generate sshkey. - https://www.digitalocean.com/community/tutorials/how-to-set-up-ssh-keys--2
+          ssh-keygen -t rsa  (press enter, enter, enter)
+
+e.	Copy the sshkey to your host
+          ssh-copy-id hostuser@192.168.x.x (type password when prompted)
+
+f.	Sample shell command running docker-compose:
+shell_command:
+	run_docker_compose: ssh -l hass 192.168.1.XXX "cd ~/docker/homeassistant/templates && sudo docker-compose up -d"
+
+2.	Create a shell script run via cron saving to /usr/bin/local/. i.e script.sh and then sudo chmod a+rx script.sh
+
+This script will interrogate Facebox to confirm the previously taught face is still in the container and return the associated name if the face is still there. The output is saved in a txt file under a directory I created.
+
+###THIS SCRIPT GETS SENSOR VALUES VIA COMMAND LINE AND EXPORTS INTO A TXT FILE TO BE READ BY THE HA CONTAINER ######################
+
+#!/bin/bash
+curl -H 'Content-Type: application/json' -d '{"url":"https://mydomain.duckdns.org/local/facebox/teach/xyx/xyz.jpg?api_password=XXXXXX"}' http://192.168.1.XXX:8080/facebox/similars | head -14 | grep -i "name" > /home/hass/docker/homeassistant/sensors_dir/x.sensors/x.facebox.txt
+
+Add cron job to run the script every minute.
+
+The “mydomain.duckdns” part pulls the previously taught face from the directory (in my case it’s the directory I created initially to load the faces utilising the teach.py script from above) and compares it to what’s available in the Facebox container. If there’s a match it returns the name associated with that image.
+
+xyz is one of the pictures loaded during the teaching process in step 2 of the Sample Automation process above.
+
+
+3.	Create a binary sensor which reads the results from step 2 and returns on (face still loaded) or off (no face)
+
+binary_sensor:
+- platform: command_line
+  name: Facebox Loaded
+  command: cat /config/sensors_dir/x.sensors/x.facebox.txt | awk 'FNR==1 {print $2}' | sed 's/"//g'
+  device_class: connectivity
+  scan_interval: 5
+  payload_on: "xyz"
+  payload_off: "dead"
+  value_template: '{%- if value == "xyz" -%} xyz {%- else -%} dead {%- endif -%}'
+
+
+</config/sensors_dir/x.sensors/x.facebox.txt is the txt file created in step 2. The path needs to be your designated path.>
+
+4.	Shell command: This is the shell command which will execute the action in the automation below. This will utilise the ssh set up implemented in step 1.
+
+shell_command:
+  facebox_teach: ssh -l hass 192.168.1.XXX "cd ~/docker/homeassistant/www/facebox/teach/ && python teach.py"
+
+5.	Automation: This automation will read the state of the sensor created in step 3 and if off will action the shell command in step 4.
+
+automation:
+- id: facebox_teach
+  alias: 'Facebox Teach'
+  initial_state: on
+  trigger:
+  - platform: time
+    minutes: '/1'
+    seconds: 0
+  condition:
+  - condition: state
+    entity_id: binary_sensor.facebox_loaded
+    state: 'off'
+  action:
+  - delay: 00:00:05
+  - service: shell_command.facebox_teach
